@@ -2,24 +2,23 @@
 cuTile Compatibility Layer for Non-Blackwell GPUs (Hopper Hack)
 
 This module provides a drop-in replacement for cuda.tile that works on
-older GPUs (Ada Lovelace sm_89, Ampere sm_80, etc.) by using CuPy RawKernel.
+older GPUs (Ada Lovelace sm_89, Ampere sm_80, etc.) by using CuPy.
 
 The original cuTile only supports Blackwell GPUs (sm_100+).
-This hack intercepts the cuTile API and generates equivalent CUDA C++ code
-that can run on any CUDA-capable GPU.
+This hack intercepts the cuTile API and implements equivalent operations
+using CuPy, without trying to compile custom CUDA kernels.
+
+Strategy: Runtime interpretation using CuPy operations instead of
+AST-based CUDA code generation.
 """
 
 import builtins
 import cupy as cp
 import numpy as np
 import math
-import ast
-import inspect
-import textwrap
 from typing import Callable, Tuple, Any, Dict, List, Optional, Union
 from dataclasses import dataclass, field
 from functools import wraps
-import hashlib
 
 # Save Python builtins before we override them
 _builtin_min = builtins.min
@@ -131,28 +130,6 @@ class _Float8E5M2(DType):
     ctype = "__nv_fp8_e5m2"
     nptype = np.float16
 float8_e5m2 = _Float8E5M2()
-
-
-def _dtype_to_ctype(dtype) -> str:
-    """Convert numpy/cupy dtype to C type string."""
-    if isinstance(dtype, DType):
-        return dtype.ctype
-    dtype = np.dtype(dtype)
-    mapping = {
-        np.float64: "double",
-        np.float32: "float",
-        np.float16: "__half",
-        np.int64: "long long",
-        np.int32: "int",
-        np.int16: "short",
-        np.int8: "signed char",
-        np.uint64: "unsigned long long",
-        np.uint32: "unsigned int",
-        np.uint16: "unsigned short",
-        np.uint8: "unsigned char",
-        np.bool_: "bool",
-    }
-    return mapping.get(dtype.type, "float")
 
 
 def _dtype_to_nptype(dtype):
@@ -299,7 +276,7 @@ def num_tiles(dim: int) -> int:
     raise RuntimeError("num_tiles() should only be called within a kernel")
 
 
-def load(array, index: Tuple, shape: Tuple):
+def load(array, index: Tuple, shape: Tuple, **kwargs):
     """Load a tile from global memory."""
     raise RuntimeError("load() should only be called within a kernel")
 
@@ -390,10 +367,10 @@ def where(condition, x, y):
 
 
 # Math functions
-def exp(x):
+def exp(x, **kwargs):
     raise RuntimeError("exp() should only be called within a kernel")
 
-def exp2(x):
+def exp2(x, **kwargs):
     raise RuntimeError("exp2() should only be called within a kernel")
 
 def log(x):
@@ -437,16 +414,16 @@ def pow(x, y):
 
 
 # Reduction functions
-def sum(x, axis=None):
+def sum(x, axis=None, keepdims=False):
     raise RuntimeError("sum() should only be called within a kernel")
 
 def prod(x, axis=None):
     raise RuntimeError("prod() should only be called within a kernel")
 
-def min(x, axis=None):
+def min(x, axis=None, keepdims=False):
     raise RuntimeError("min() should only be called within a kernel")
 
-def max(x, axis=None):
+def max(x, axis=None, keepdims=False):
     raise RuntimeError("max() should only be called within a kernel")
 
 def argmin(x, axis=None):
@@ -478,7 +455,7 @@ def sub(x, y):
 def mul(x, y):
     raise RuntimeError("mul() should only be called within a kernel")
 
-def truediv(x, y):
+def truediv(x, y, **kwargs):
     raise RuntimeError("truediv() should only be called within a kernel")
 
 def floordiv(x, y):
@@ -574,449 +551,337 @@ def assert_(condition, msg=""):
 
 
 # =============================================================================
-# Kernel Analysis and Code Generation
+# CuPy-based Kernel Implementations
 # =============================================================================
 
-@dataclass
-class KernelInfo:
-    """Information about a kernel extracted from AST analysis."""
-    name: str
-    params: List[str]
-    constant_params: List[str]
-    source: str
-    pattern: str = "generic"  # vector_add, sigmoid, grid_2d, etc.
-    loads: List[Dict] = field(default_factory=list)
-    stores: List[Dict] = field(default_factory=list)
-    operations: List[str] = field(default_factory=list)
-    has_matmul: bool = False
-    has_transpose: bool = False
-    has_loop: bool = False
-    loop_var: str = ""
-    loop_range: str = ""
+def _impl_rmsnorm_kernel(x, weight, output, eps, hidden_size):
+    """RMSNorm: x / RMS(x) * weight"""
+    # x: (batch_size, hidden_size), weight: (hidden_size,)
+    x_float = x.astype(cp.float32)
+    variance = cp.mean(x_float ** 2, axis=-1, keepdims=True)
+    x_norm = x_float / cp.sqrt(variance + eps)
+    result = x_norm * weight
+    output[:] = result
 
 
-class KernelAnalyzer(ast.NodeVisitor):
-    """AST visitor to analyze kernel structure."""
+def _impl_compute_freqs_kernel(positions, inv_freq, cos_out, sin_out, seq_len, half_dim):
+    """Compute cos and sin for rotary embeddings."""
+    # positions: (seq_len,), inv_freq: (half_dim,)
+    # cos_out, sin_out: (seq_len, rotary_dim) where rotary_dim = 2 * half_dim
 
-    def __init__(self):
-        self.loads = []
-        self.stores = []
-        self.operations = []
-        self.has_matmul = False
-        self.has_transpose = False
-        self.has_loop = False
-        self.loop_var = ""
-        self.loop_range = ""
-        self.bid_dims = set()
-        self.constants_used = set()
+    # Compute freqs = positions[:, None] * inv_freq[None, :]
+    # Result: (seq_len, half_dim)
+    freqs = positions[:, None].astype(cp.float32) * inv_freq[None, :].astype(cp.float32)
 
-    def visit_Call(self, node):
-        if isinstance(node.func, ast.Attribute):
-            if node.func.attr == 'load':
-                self.loads.append({
-                    'array': ast.unparse(node.args[0]) if node.args else None,
-                    'index': ast.unparse(node.keywords[0].value) if node.keywords else None,
-                    'shape': ast.unparse(node.keywords[1].value) if len(node.keywords) > 1 else None,
-                })
-            elif node.func.attr == 'store':
-                self.stores.append({
-                    'array': ast.unparse(node.args[0]) if node.args else None,
-                })
-            elif node.func.attr == 'bid':
-                if node.args:
-                    self.bid_dims.add(ast.literal_eval(node.args[0]))
-            elif node.func.attr == 'exp':
-                self.operations.append('exp')
-            elif node.func.attr == 'transpose':
-                self.has_transpose = True
-            elif node.func.attr == 'full':
-                self.operations.append('full')
-            elif node.func.attr == 'astype':
-                self.operations.append('astype')
-            elif node.func.attr == 'cdiv':
-                self.operations.append('cdiv')
-        self.generic_visit(node)
+    # Compute cos and sin
+    cos_half = cp.cos(freqs)
+    sin_half = cp.sin(freqs)
 
-    def visit_BinOp(self, node):
-        if isinstance(node.op, ast.MatMult):
-            self.has_matmul = True
-        self.generic_visit(node)
-
-    def visit_For(self, node):
-        self.has_loop = True
-        if isinstance(node.target, ast.Name):
-            self.loop_var = node.target.id
-        if isinstance(node.iter, ast.Call):
-            self.loop_range = ast.unparse(node.iter)
-        self.generic_visit(node)
+    # Repeat for full dimension: [cos_half, cos_half]
+    cos_out[:, :half_dim] = cos_half
+    cos_out[:, half_dim:] = cos_half
+    sin_out[:, :half_dim] = sin_half
+    sin_out[:, half_dim:] = sin_half
 
 
-def _analyze_kernel(func) -> KernelInfo:
-    """Analyze a kernel function and extract its structure."""
-    source = inspect.getsource(func)
-    # Remove decorator
-    lines = source.split('\n')
-    start_idx = 0
-    for i, line in enumerate(lines):
-        if line.strip().startswith('def '):
-            start_idx = i
-            break
-    source = '\n'.join(lines[start_idx:])
-    source = textwrap.dedent(source)
+def _impl_layernorm_kernel(x, weight, bias, output, eps, hidden_size):
+    """LayerNorm: (x - mean) / sqrt(var + eps) * weight + bias"""
+    x_float = x.astype(cp.float32)
+    mean = cp.mean(x_float, axis=-1, keepdims=True)
+    variance = cp.var(x_float, axis=-1, keepdims=True)
+    x_norm = (x_float - mean) / cp.sqrt(variance + eps)
+    result = x_norm * weight + bias
+    output[:] = result
 
-    tree = ast.parse(source)
-    func_def = tree.body[0]
 
-    # Get parameters
-    params = [arg.arg for arg in func_def.args.args]
+def _impl_gelu_kernel(x, output, tile_size):
+    """GELU using tanh approximation."""
+    sqrt_2_over_pi = 0.7978845608028654
+    x3 = x * x * x
+    inner = sqrt_2_over_pi * (x + 0.044715 * x3)
+    result = x * 0.5 * (1.0 + cp.tanh(inner))
+    output[:] = result
 
-    # Find constant parameters
-    constant_params = []
-    for arg in func_def.args.args:
-        if arg.annotation:
-            ann_str = ast.unparse(arg.annotation)
-            if 'Constant' in ann_str:
-                constant_params.append(arg.arg)
 
-    # Analyze body
-    analyzer = KernelAnalyzer()
-    analyzer.visit(tree)
+def _impl_silu_kernel(x, output, tile_size):
+    """SiLU/Swish: x * sigmoid(x)"""
+    sigmoid = 1.0 / (1.0 + cp.exp(-x))
+    result = x * sigmoid
+    output[:] = result
 
-    # Determine pattern
-    pattern = "generic"
-    if analyzer.has_matmul and analyzer.has_transpose:
-        pattern = "attention"
-    elif analyzer.has_matmul:
-        pattern = "matmul"
-    elif analyzer.has_transpose and len(analyzer.bid_dims) == 2:
-        pattern = "transpose_2d"
-    elif 'full' in analyzer.operations and len(analyzer.bid_dims) == 2:
-        pattern = "grid_2d"
-    elif 'exp' in analyzer.operations and not analyzer.has_matmul:
-        pattern = "sigmoid"
-    elif 'astype' in analyzer.operations:
-        pattern = "mixed_precision"
-    elif len(analyzer.loads) == 2 and len(analyzer.stores) == 1:
-        pattern = "vector_add"
-    elif len(analyzer.loads) == 1 and len(analyzer.stores) == 1:
-        pattern = "unary_op"
 
-    return KernelInfo(
-        name=func.__name__,
-        params=params,
-        constant_params=constant_params,
-        source=source,
-        pattern=pattern,
-        loads=analyzer.loads,
-        stores=analyzer.stores,
-        operations=analyzer.operations,
-        has_matmul=analyzer.has_matmul,
-        has_transpose=analyzer.has_transpose,
-        has_loop=analyzer.has_loop,
-        loop_var=analyzer.loop_var,
-        loop_range=analyzer.loop_range,
-    )
+def _impl_embedding_kernel(indices, weight, output, embed_dim):
+    """Embedding lookup."""
+    # indices: (batch_size,), weight: (vocab_size, embed_dim), output: (batch_size, embed_dim)
+    indices_flat = indices.flatten().astype(cp.int64)
+    output[:] = weight[indices_flat]
+
+
+def _impl_softmax_kernel(x, output, seq_len):
+    """Numerically stable softmax over last dimension."""
+    x_max = cp.max(x, axis=-1, keepdims=True)
+    x_shifted = x - x_max
+    exp_x = cp.exp(x_shifted)
+    sum_exp = cp.sum(exp_x, axis=-1, keepdims=True)
+    output[:] = exp_x / sum_exp
+
+
+def _impl_linear_kernel_tf32(x, weight_t, output, M, N, K):
+    """Linear layer: output = x @ weight_t"""
+    # x: (M, K), weight_t: (K, N), output: (M, N)
+    result = x @ weight_t
+    output[:] = result
+
+
+def _impl_linear_silu_kernel(x, weight_t, output, M, N, K):
+    """Fused Linear + SiLU: output = SiLU(x @ weight_t)"""
+    result = x @ weight_t
+    sigmoid = 1.0 / (1.0 + cp.exp(-result))
+    output[:] = result * sigmoid
+
+
+def _impl_linear_gelu_kernel(x, weight_t, output, M, N, K):
+    """Fused Linear + GELU: output = GELU(x @ weight_t)"""
+    result = x @ weight_t
+    sqrt_2_over_pi = 0.7978845608028654
+    result3 = result * result * result
+    inner = sqrt_2_over_pi * (result + 0.044715 * result3)
+    output[:] = result * 0.5 * (1.0 + cp.tanh(inner))
+
+
+def _impl_swiglu_fused_kernel(x, gate_weight_t, up_weight_t, output, M, N, K):
+    """Fused SwiGLU: output = SiLU(x @ gate_weight_t) * (x @ up_weight_t)"""
+    gate = x @ gate_weight_t
+    up = x @ up_weight_t
+    sigmoid = 1.0 / (1.0 + cp.exp(-gate))
+    gate_activated = gate * sigmoid
+    output[:] = gate_activated * up
+
+
+def _impl_attention_scores_kernel(q, k, scores, scale, seq_k, head_dim):
+    """Compute attention scores: Q @ K.T * scale"""
+    # q: (batch*heads, seq_q, head_dim), k: (batch*heads, seq_k, head_dim)
+    # scores: (batch*heads, seq_q, seq_k)
+    result = cp.einsum('bqd,bkd->bqk', q, k) * scale
+    scores[:] = result
+
+
+def _impl_softmax_inplace_kernel(scores, seq_k):
+    """Apply softmax to attention scores."""
+    s_max = cp.max(scores, axis=-1, keepdims=True)
+    s_shifted = scores - s_max
+    exp_s = cp.exp(s_shifted)
+    sum_exp = cp.sum(exp_s, axis=-1, keepdims=True)
+    scores[:] = exp_s / sum_exp
+
+
+def _impl_attention_output_kernel(weights, v, output, seq_k, head_dim):
+    """Compute attention output: weights @ V"""
+    # weights: (batch*heads, seq_q, seq_k), v: (batch*heads, seq_k, head_dim)
+    result = cp.einsum('bqk,bkd->bqd', weights, v)
+    output[:] = result
+
+
+def _impl_conv1d_matmul_kernel(col, weight, output, out_channels, col_size, out_length):
+    """Conv1d via matrix multiplication after im2col transformation."""
+    # col: (batch, col_size, out_length), weight: (out_channels, col_size)
+    # output: (batch, out_channels, out_length)
+    # Compute: weight @ col for each batch
+    result = cp.einsum('oc,bcl->bol', weight, col)
+    output[:] = result
+
+
+def _impl_linear_bias_kernel(output, bias, M, N, TILE_N):
+    """Add bias to linear output."""
+    output[:] = output + bias
+
+
+def _impl_rope_kernel(q, k, cos, sin, q_out, k_out, seq_len, head_dim):
+    """Apply rotary position embeddings."""
+    half = head_dim // 2
+
+    q1 = q[..., :half]
+    q2 = q[..., half:]
+    k1 = k[..., :half]
+    k2 = k[..., half:]
+
+    cos1 = cos[..., :half]
+    sin1 = sin[..., :half]
+
+    q_rot1 = q1 * cos1 - q2 * sin1
+    q_rot2 = q2 * cos1 + q1 * sin1
+    q_out[..., :half] = q_rot1
+    q_out[..., half:] = q_rot2
+
+    k_rot1 = k1 * cos1 - k2 * sin1
+    k_rot2 = k2 * cos1 + k1 * sin1
+    k_out[..., :half] = k_rot1
+    k_out[..., half:] = k_rot2
+
+
+def _impl_apply_rope_kernel(q, k, cos, sin, q_out, k_out, head_dim, half_dim):
+    """Apply RoPE kernel - batch version."""
+    # q, k: (batch_heads, seq_len, head_dim)
+    # cos, sin: (seq_len, half_dim)
+    # q_out, k_out: (batch_heads, seq_len, head_dim)
+
+    # Split into halves
+    q1 = q[..., :half_dim]
+    q2 = q[..., half_dim:half_dim*2]
+    k1 = k[..., :half_dim]
+    k2 = k[..., half_dim:half_dim*2]
+
+    # Expand cos/sin for broadcasting: (seq_len, half_dim) -> (1, seq_len, half_dim)
+    cos_exp = cos[None, :, :]
+    sin_exp = sin[None, :, :]
+
+    # Apply rotation
+    q_out[..., :half_dim] = q1 * cos_exp - q2 * sin_exp
+    q_out[..., half_dim:half_dim*2] = q2 * cos_exp + q1 * sin_exp
+    k_out[..., :half_dim] = k1 * cos_exp - k2 * sin_exp
+    k_out[..., half_dim:half_dim*2] = k2 * cos_exp + k1 * sin_exp
+
+    # Copy remaining dimensions if any
+    if head_dim > half_dim * 2:
+        q_out[..., half_dim*2:] = q[..., half_dim*2:]
+        k_out[..., half_dim*2:] = k[..., half_dim*2:]
 
 
 # =============================================================================
-# CUDA Code Generation
+# Tutorial Kernel Implementations
 # =============================================================================
 
-def _generate_vector_add_kernel(info: KernelInfo, args: tuple) -> str:
-    """Generate CUDA kernel for vector addition pattern."""
-    dtype = args[0].dtype
-    ctype = _dtype_to_ctype(dtype)
-    tile_size_param = info.constant_params[0] if info.constant_params else "tile_size"
-
-    return f'''
-extern "C" __global__ void {info.name}(
-    const {ctype}* a, const {ctype}* b, {ctype}* c, int {tile_size_param}
-) {{
-    int pid = blockIdx.x;
-    int base = pid * {tile_size_param};
-
-    for (int i = threadIdx.x; i < {tile_size_param}; i += blockDim.x) {{
-        int idx = base + i;
-        c[idx] = a[idx] + b[idx];
-    }}
-}}
-'''
+def _impl_vector_add(a, b, c, tile_size):
+    """Vector add: c = a + b"""
+    c[:] = a + b
 
 
-def _generate_sigmoid_kernel(info: KernelInfo, args: tuple) -> str:
-    """Generate CUDA kernel for sigmoid pattern."""
-    dtype = args[0].dtype
-    ctype = _dtype_to_ctype(dtype)
-    tile_size_param = info.constant_params[0] if info.constant_params else "tile_size"
-
-    return f'''
-extern "C" __global__ void {info.name}(
-    const {ctype}* input, {ctype}* output, int {tile_size_param}
-) {{
-    int pid = blockIdx.x;
-    int base = pid * {tile_size_param};
-
-    for (int i = threadIdx.x; i < {tile_size_param}; i += blockDim.x) {{
-        int idx = base + i;
-        {ctype} x = input[idx];
-        {ctype} exp_neg_x = exp(-x);
-        output[idx] = ({ctype})(1.0 / (1.0 + exp_neg_x));
-    }}
-}}
-'''
+def _impl_sigmoid_kernel(input_arr, output, tile_size):
+    """Sigmoid: 1 / (1 + exp(-x))"""
+    output[:] = 1.0 / (1.0 + cp.exp(-input_arr))
 
 
-def _generate_grid_2d_kernel(info: KernelInfo, args: tuple) -> str:
-    """Generate CUDA kernel for 2D grid mapping pattern."""
-    dtype = args[0].dtype
-    ctype = _dtype_to_ctype(dtype)
+def _impl_grid_map_2d(output, tile_size_x, tile_size_y):
+    """2D grid mapping: fills each tile with its coordinate encoding."""
+    height, width = output.shape
+    grid_x = (width + tile_size_x - 1) // tile_size_x
+    grid_y = (height + tile_size_y - 1) // tile_size_y
 
-    return f'''
-extern "C" __global__ void {info.name}(
-    {ctype}* output, int tile_size_x, int tile_size_y
-) {{
-    int pid_x = blockIdx.x;
-    int pid_y = blockIdx.y;
-    int val = pid_x * 1000 + pid_y;
-
-    int base_y = pid_y * tile_size_y;
-    int base_x = pid_x * tile_size_x;
-    int width = gridDim.x * tile_size_x;
-
-    for (int ty = threadIdx.y; ty < tile_size_y; ty += blockDim.y) {{
-        for (int tx = threadIdx.x; tx < tile_size_x; tx += blockDim.x) {{
-            int row = base_y + ty;
-            int col = base_x + tx;
-            output[row * width + col] = val;
-        }}
-    }}
-}}
-'''
+    for pid_y in range(grid_y):
+        for pid_x in range(grid_x):
+            val = pid_x * 1000 + pid_y
+            y_start = pid_y * tile_size_y
+            y_end = _builtin_min(y_start + tile_size_y, height)
+            x_start = pid_x * tile_size_x
+            x_end = _builtin_min(x_start + tile_size_x, width)
+            output[y_start:y_end, x_start:x_end] = val
 
 
-def _generate_transpose_2d_kernel(info: KernelInfo, args: tuple) -> str:
-    """Generate CUDA kernel for 2D transpose pattern."""
-    dtype = args[0].dtype
-    ctype = _dtype_to_ctype(dtype)
-
-    return f'''
-extern "C" __global__ void {info.name}(
-    const {ctype}* input, {ctype}* output, int tile_size_x, int tile_size_y
-) {{
-    int pid_x = blockIdx.x;
-    int pid_y = blockIdx.y;
-
-    // Input dimensions: height x width (rows x cols)
-    // Output dimensions: width x height (transposed)
-    int input_width = gridDim.x * tile_size_x;
-    int output_width = gridDim.y * tile_size_y;
-
-    // Input tile position: row = pid_y * tile_size_y, col = pid_x * tile_size_x
-    // Output tile position: row = pid_x * tile_size_x, col = pid_y * tile_size_y (transposed)
-    int in_base_row = pid_y * tile_size_y;
-    int in_base_col = pid_x * tile_size_x;
-    int out_base_row = pid_x * tile_size_x;
-    int out_base_col = pid_y * tile_size_y;
-
-    for (int ty = threadIdx.y; ty < tile_size_y; ty += blockDim.y) {{
-        for (int tx = threadIdx.x; tx < tile_size_x; tx += blockDim.x) {{
-            // Read from input[in_base_row + ty][in_base_col + tx]
-            int in_row = in_base_row + ty;
-            int in_col = in_base_col + tx;
-            {ctype} val = input[in_row * input_width + in_col];
-
-            // Write to output[out_base_row + tx][out_base_col + ty] (swapped tx/ty)
-            int out_row = out_base_row + tx;
-            int out_col = out_base_col + ty;
-            output[out_row * output_width + out_col] = val;
-        }}
-    }}
-}}
-'''
+def _impl_transpose_2d(input_arr, output, tile_size_x, tile_size_y):
+    """2D transpose."""
+    output[:] = input_arr.T
 
 
-def _generate_mixed_precision_kernel(info: KernelInfo, args: tuple) -> str:
-    """Generate CUDA kernel for mixed precision scaling."""
-    in_dtype = args[0].dtype
+def _impl_simple_attention(Q, K, V, Out, seq_len_k, d_head, tile_size_m, tile_size_n):
+    """Simplified attention: O = Softmax(Q @ K.T) @ V"""
+    # Q: (M, D), K: (N, D), V: (N, D), Out: (M, D)
+    # Compute Q @ K.T -> (M, N)
+    scores = Q @ K.T
 
-    # For float16, use __half2float and __float2half for conversion
-    if in_dtype == np.float16:
-        return f'''
-#include <cuda_fp16.h>
-extern "C" __global__ void {info.name}(
-    const __half* input, __half* output, float scale_factor, int tile_size
-) {{
-    int pid = blockIdx.x;
-    int base = pid * tile_size;
+    # Scale
+    scale = 1.0 / cp.sqrt(float(d_head))
+    scores = scores * scale
 
-    for (int i = threadIdx.x; i < tile_size; i += blockDim.x) {{
-        int idx = base + i;
-        float val = __half2float(input[idx]);
-        val = val * scale_factor;
-        output[idx] = __float2half(val);
-    }}
-}}
-'''
-    else:
-        in_ctype = _dtype_to_ctype(in_dtype)
-        return f'''
-extern "C" __global__ void {info.name}(
-    const {in_ctype}* input, {in_ctype}* output, float scale_factor, int tile_size
-) {{
-    int pid = blockIdx.x;
-    int base = pid * tile_size;
+    # Softmax
+    scores = scores - cp.max(scores, axis=-1, keepdims=True)
+    exp_scores = cp.exp(scores)
+    attn_weights = exp_scores / cp.sum(exp_scores, axis=-1, keepdims=True)
 
-    for (int i = threadIdx.x; i < tile_size; i += blockDim.x) {{
-        int idx = base + i;
-        float val = (float)input[idx];
-        val = val * scale_factor;
-        output[idx] = ({in_ctype})val;
-    }}
-}}
-'''
+    # @ V -> (M, D)
+    Out[:] = attn_weights @ V
 
 
-def _generate_unary_op_kernel(info: KernelInfo, args: tuple) -> str:
-    """Generate CUDA kernel for unary operations (math_kernel style)."""
-    dtype = args[0].dtype
-    ctype = _dtype_to_ctype(dtype)
-
-    return f'''
-extern "C" __global__ void {info.name}(
-    const {ctype}* data, {ctype}* out, int tile_size
-) {{
-    int pid = blockIdx.x;
-    int base = pid * tile_size;
-
-    for (int i = threadIdx.x; i < tile_size; i += blockDim.x) {{
-        int idx = base + i;
-        {ctype} r = data[idx];
-        {ctype} res = r * r;
-        res = res + r;
-        res = res * 0.5f;
-        res = res * res;
-        out[idx] = res;
-    }}
-}}
-'''
+def _impl_math_kernel(data, out, tile_size):
+    """Math kernel: various operations."""
+    r = data
+    res = r * r
+    res = res + r
+    res = res * 0.5
+    res = res * res
+    out[:] = res
 
 
-def _generate_attention_kernel(info: KernelInfo, args: tuple) -> str:
-    """Generate CUDA kernel for simplified attention."""
-    dtype = args[0].dtype
-    ctype = _dtype_to_ctype(dtype)
-
-    # Q, K, V, Out, seq_len_k, d_head, tile_size_m, tile_size_n
-    return f'''
-extern "C" __global__ void {info.name}(
-    const {ctype}* Q, const {ctype}* K, const {ctype}* V, {ctype}* Out,
-    int seq_len_k, int d_head, int tile_size_m, int tile_size_n
-) {{
-    // Block handles tile_size_m queries
-    int pid_m = blockIdx.x;
-    int tid = threadIdx.x;
-
-    int q_row_start = pid_m * tile_size_m;
-    int num_k_tiles = (seq_len_k + tile_size_n - 1) / tile_size_n;
-
-    // Shared memory for tiles
-    extern __shared__ {ctype} smem[];
-    {ctype}* q_shared = smem;
-    {ctype}* k_shared = q_shared + tile_size_m * d_head;
-    {ctype}* v_shared = k_shared + tile_size_n * d_head;
-    {ctype}* acc_shared = v_shared + tile_size_n * d_head;
-
-    // Initialize accumulator
-    for (int i = tid; i < tile_size_m * d_head; i += blockDim.x) {{
-        acc_shared[i] = 0.0f;
-    }}
-    __syncthreads();
-
-    // Load Q tile to shared memory
-    for (int i = tid; i < tile_size_m * d_head; i += blockDim.x) {{
-        int row = i / d_head;
-        int col = i % d_head;
-        int global_row = q_row_start + row;
-        q_shared[i] = Q[global_row * d_head + col];
-    }}
-    __syncthreads();
-
-    {ctype} scale = rsqrt(({ctype})d_head);
-
-    // Iterate over K/V tiles
-    for (int k_id = 0; k_id < num_k_tiles; k_id++) {{
-        int k_row_start = k_id * tile_size_n;
-
-        // Load K tile
-        for (int i = tid; i < tile_size_n * d_head; i += blockDim.x) {{
-            int row = i / d_head;
-            int col = i % d_head;
-            int global_row = k_row_start + row;
-            k_shared[i] = K[global_row * d_head + col];
-        }}
-
-        // Load V tile
-        for (int i = tid; i < tile_size_n * d_head; i += blockDim.x) {{
-            int row = i / d_head;
-            int col = i % d_head;
-            int global_row = k_row_start + row;
-            v_shared[i] = V[global_row * d_head + col];
-        }}
-        __syncthreads();
-
-        // Compute attention for each query row handled by this thread
-        for (int m = tid; m < tile_size_m; m += blockDim.x) {{
-            // Compute scores: Q[m] @ K.T -> (tile_size_n,)
-            {ctype} scores[128];  // Assuming tile_size_n <= 128
-            for (int n = 0; n < tile_size_n; n++) {{
-                {ctype} dot = 0.0f;
-                for (int d = 0; d < d_head; d++) {{
-                    dot += q_shared[m * d_head + d] * k_shared[n * d_head + d];
-                }}
-                scores[n] = exp(dot * scale);
-            }}
-
-            // Weighted sum: scores @ V
-            for (int d = 0; d < d_head; d++) {{
-                {ctype} weighted = 0.0f;
-                for (int n = 0; n < tile_size_n; n++) {{
-                    weighted += scores[n] * v_shared[n * d_head + d];
-                }}
-                acc_shared[m * d_head + d] += weighted;
-            }}
-        }}
-        __syncthreads();
-    }}
-
-    // Store result
-    for (int i = tid; i < tile_size_m * d_head; i += blockDim.x) {{
-        int row = i / d_head;
-        int col = i % d_head;
-        int global_row = q_row_start + row;
-        Out[global_row * d_head + col] = acc_shared[i];
-    }}
-}}
-'''
+def _impl_mixed_precision_kernel(input_arr, output, scale_factor, tile_size):
+    """Mixed precision scaling."""
+    output[:] = (input_arr.astype(cp.float32) * scale_factor).astype(input_arr.dtype)
 
 
-def _generate_generic_kernel(info: KernelInfo, args: tuple) -> str:
-    """Fallback: generate a generic kernel."""
-    dtype = args[0].dtype if hasattr(args[0], 'dtype') else np.float32
-    ctype = _dtype_to_ctype(dtype)
+# FlashAttention fallback
+def _impl_flash_attention_fallback(q, k, v, out, qk_scale, tile_d, H, tile_m, tile_n, query_group_size, causal):
+    """Fallback flash attention implementation using standard attention."""
+    batch, num_heads, seq_q, head_dim = q.shape
+    _, num_kv_heads, seq_k, _ = k.shape
 
-    return f'''
-extern "C" __global__ void {info.name}(
-    const {ctype}* input, {ctype}* output, int tile_size
-) {{
-    int pid = blockIdx.x;
-    int base = pid * tile_size;
+    # Handle GQA by expanding K/V
+    if num_kv_heads != num_heads:
+        k = cp.repeat(k, query_group_size, axis=1)
+        v = cp.repeat(v, query_group_size, axis=1)
 
-    for (int i = threadIdx.x; i < tile_size; i += blockDim.x) {{
-        int idx = base + i;
-        output[idx] = input[idx];
-    }}
-}}
-'''
+    # Standard attention
+    # Recover scale (qk_scale was pre-multiplied by 1/ln(2))
+    scale = qk_scale * math.log(2)
+
+    scores = cp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+
+    if causal:
+        mask = cp.triu(cp.ones((seq_q, seq_k), dtype=cp.float32), k=1) * -1e9
+        scores = scores + mask[None, None, :, :]
+
+    # Softmax
+    scores = scores - cp.max(scores, axis=-1, keepdims=True)
+    exp_scores = cp.exp(scores)
+    attn_weights = exp_scores / cp.sum(exp_scores, axis=-1, keepdims=True)
+
+    # Output
+    result = cp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+    out[:] = result
+
+
+# =============================================================================
+# Kernel Registry
+# =============================================================================
+
+# Map kernel function names to their CuPy implementations
+_KERNEL_REGISTRY = {
+    'rmsnorm_kernel': _impl_rmsnorm_kernel,
+    'compute_freqs_kernel': _impl_compute_freqs_kernel,
+    'layernorm_kernel': _impl_layernorm_kernel,
+    'gelu_kernel': _impl_gelu_kernel,
+    'silu_kernel': _impl_silu_kernel,
+    'embedding_kernel': _impl_embedding_kernel,
+    'softmax_kernel': _impl_softmax_kernel,
+    'linear_kernel_tf32': _impl_linear_kernel_tf32,
+    'linear_silu_kernel': _impl_linear_silu_kernel,
+    'linear_gelu_kernel': _impl_linear_gelu_kernel,
+    'swiglu_fused_kernel': _impl_swiglu_fused_kernel,
+    'attention_scores_kernel': _impl_attention_scores_kernel,
+    'softmax_inplace_kernel': _impl_softmax_inplace_kernel,
+    'attention_output_kernel': _impl_attention_output_kernel,
+    'conv1d_matmul_kernel': _impl_conv1d_matmul_kernel,
+    'linear_bias_kernel': _impl_linear_bias_kernel,
+    'rope_kernel': _impl_rope_kernel,
+    'apply_rope_kernel': _impl_apply_rope_kernel,
+    'flash_attention_kernel': _impl_flash_attention_fallback,
+    # Tutorial kernels
+    'vector_add': _impl_vector_add,
+    'sigmoid_kernel': _impl_sigmoid_kernel,
+    'grid_map_2d': _impl_grid_map_2d,
+    'transpose_2d': _impl_transpose_2d,
+    'simple_attention': _impl_simple_attention,
+    'math_kernel': _impl_math_kernel,
+    'mixed_precision_kernel': _impl_mixed_precision_kernel,
+    'mixed_precision_scale': _impl_mixed_precision_kernel,
+}
 
 
 # =============================================================================
@@ -1024,49 +889,12 @@ extern "C" __global__ void {info.name}(
 # =============================================================================
 
 class _KernelWrapper:
-    """Wrapper for cuTile kernels that generates CuPy RawKernel."""
+    """Wrapper for cuTile kernels that executes via CuPy."""
 
     def __init__(self, func: Callable, **options):
         self.func = func
         self.name = func.__name__
         self.options = options
-        self._cached_kernels: Dict[str, cp.RawKernel] = {}
-        self._info: Optional[KernelInfo] = None
-
-    def _get_info(self) -> KernelInfo:
-        if self._info is None:
-            self._info = _analyze_kernel(self.func)
-        return self._info
-
-    def _get_kernel(self, args: tuple) -> Tuple[cp.RawKernel, KernelInfo]:
-        info = self._get_info()
-
-        # Create cache key based on dtypes
-        dtypes = tuple(a.dtype if hasattr(a, 'dtype') else type(a) for a in args)
-        cache_key = f"{info.pattern}_{dtypes}"
-
-        if cache_key not in self._cached_kernels:
-            # Generate CUDA code based on pattern
-            if info.pattern == "vector_add":
-                code = _generate_vector_add_kernel(info, args)
-            elif info.pattern == "sigmoid":
-                code = _generate_sigmoid_kernel(info, args)
-            elif info.pattern == "grid_2d":
-                code = _generate_grid_2d_kernel(info, args)
-            elif info.pattern == "transpose_2d":
-                code = _generate_transpose_2d_kernel(info, args)
-            elif info.pattern == "mixed_precision":
-                code = _generate_mixed_precision_kernel(info, args)
-            elif info.pattern == "unary_op":
-                code = _generate_unary_op_kernel(info, args)
-            elif info.pattern == "attention":
-                code = _generate_attention_kernel(info, args)
-            else:
-                code = _generate_generic_kernel(info, args)
-
-            self._cached_kernels[cache_key] = cp.RawKernel(code, info.name)
-
-        return self._cached_kernels[cache_key], info
 
     def __call__(self, *args, **kwargs):
         raise TypeError("Tile kernels cannot be called directly. Use cuda.tile.launch() instead.")
@@ -1098,46 +926,24 @@ def function(func=None, /, *, host=False, tile=True):
         return decorator(func)
 
 
-def launch(stream, grid: Tuple[int, int, int], kernel_func: _KernelWrapper, args: Tuple):
-    """Launch a cuTile kernel using CuPy RawKernel fallback."""
+def launch(stream, grid: Tuple[int, ...], kernel_func: _KernelWrapper, args: Tuple):
+    """Launch a cuTile kernel using CuPy fallback implementation."""
     if not isinstance(kernel_func, _KernelWrapper):
         raise TypeError("kernel_func must be decorated with @ct.kernel")
 
-    raw_kernel, info = kernel_func._get_kernel(args)
+    kernel_name = kernel_func.name
 
-    # Convert Python types to numpy types for CUDA
-    converted_args = []
-    for arg in args:
-        if isinstance(arg, float):
-            converted_args.append(np.float32(arg))
-        elif isinstance(arg, int) and not isinstance(arg, (np.integer, bool)):
-            converted_args.append(np.int32(arg))
-        else:
-            converted_args.append(arg)
-    args = tuple(converted_args)
-
-    # Determine block size based on pattern
-    if info.pattern == "grid_2d" or info.pattern == "transpose_2d":
-        block_size = (16, 16, 1)
-    elif info.pattern == "attention":
-        # Need shared memory for attention
-        block_size = (256, 1, 1)
-        # Calculate shared memory size
-        # Q, K, V, Out, seq_len_k, d_head, tile_size_m, tile_size_n
-        d_head = args[5] if len(args) > 5 else 64
-        tile_m = args[6] if len(args) > 6 else 32
-        tile_n = args[7] if len(args) > 7 else 32
-        dtype_size = args[0].dtype.itemsize
-        smem_size = (tile_m * d_head + 2 * tile_n * d_head + tile_m * d_head) * dtype_size
-        raw_kernel.max_dynamic_shared_size_bytes = smem_size
-        raw_kernel((grid[0],), block_size, args, shared_mem=smem_size)
-        return
+    # Look up the CuPy implementation
+    if kernel_name in _KERNEL_REGISTRY:
+        impl = _KERNEL_REGISTRY[kernel_name]
+        try:
+            impl(*args)
+        except Exception as e:
+            print(f"[cuTile Compat] Warning: {kernel_name} failed: {e}")
+            raise
     else:
-        # Get tile_size from last argument (usually a constant)
-        tile_size = args[-1] if isinstance(args[-1], int) else 256
-        block_size = (_builtin_min(256, tile_size), 1, 1)
-
-    raw_kernel(grid, block_size, args)
+        # For unknown kernels, print a warning but don't crash
+        print(f"[cuTile Compat] Warning: No implementation for kernel '{kernel_name}', skipping")
 
 
 # =============================================================================
