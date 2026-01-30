@@ -10,11 +10,38 @@ CUDA_TAG="cuda13x"
 MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
 MINICONDA_INSTALL_DIR="${HOME}/miniconda3"
 
+# Parse command line arguments
+AUTO_YES=false
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		-y|--yes)
+			AUTO_YES=true
+			shift
+			;;
+		-h|--help)
+			echo "Usage: $0 [OPTIONS]"
+			echo ""
+			echo "Options:"
+			echo "  -y, --yes    Non-interactive mode, answer yes to all prompts"
+			echo "  -h, --help   Show this help message"
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1"
+			exit 1
+			;;
+	esac
+done
+
 # =========================
 # Helper functions
 # =========================
 ask_continue() {
 	local prompt="${1:-Continue?}"
+	if [ "${AUTO_YES}" = true ]; then
+		echo ">>> ${prompt} [Y/n] y (auto)"
+		return 0
+	fi
 	read -rp ">>> ${prompt} [Y/n] " answer
 	case "${answer}" in
 	[nN] | [nN][oO])
@@ -116,7 +143,17 @@ else
 	conda create -y -n "${ENV_NAME}" python="${PYTHON_VERSION}" --override-channels -c conda-forge
 fi
 
-conda activate "${ENV_NAME}"
+# Activate the environment
+# Note: In non-interactive shells, we need to use conda run or source activate
+if [ "${AUTO_YES}" = true ]; then
+	# For non-interactive mode, set up the environment path directly
+	CONDA_ENV_PATH=$(conda info --envs | grep "^${ENV_NAME} " | awk '{print $NF}')
+	export PATH="${CONDA_ENV_PATH}/bin:${PATH}"
+	export CONDA_PREFIX="${CONDA_ENV_PATH}"
+	echo ">>> Activated environment: ${ENV_NAME}"
+else
+	conda activate "${ENV_NAME}"
+fi
 
 # =========================
 # Install CUDA Toolkit
@@ -222,7 +259,7 @@ echo ">>> Installing HuggingFace ecosystem and ML tools"
 ask_continue "Install HuggingFace (transformers, datasets, etc.) and Streamlit?"
 
 # HuggingFace ecosystem
-pip install transformers datasets huggingface_hub accelerate
+pip install transformers datasets huggingface_hub accelerate safetensors
 
 # Streamlit for web apps
 pip install streamlit
@@ -230,8 +267,20 @@ pip install streamlit
 # Audio processing (for ASR tasks)
 pip install soundfile librosa
 
-# PyTorch (if not already installed by transformers)
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+# PyTorch installation (architecture-specific)
+if [ "${IS_BLACKWELL}" = true ]; then
+	echo ">>> Installing PyTorch nightly for Blackwell (sm_120 support)..."
+	# Blackwell (sm_120) requires PyTorch nightly with CUDA 12.8+
+	pip install --pre torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
+	# Fix cuda-bindings version conflict
+	# PyTorch nightly installs cuda-bindings 12.x, but cuda-python/cuda-tile need 13.x
+	echo ">>> Fixing cuda-bindings version for cuTile compatibility..."
+	pip install "cuda-bindings~=13.1.1" "cuda-python~=13.1.1" --force-reinstall --quiet
+else
+	# Non-Blackwell: use stable PyTorch with CUDA 12.4
+	pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+fi
 
 # =========================
 # Freeze snapshot
@@ -259,8 +308,12 @@ echo "    - cuda-python"
 echo "    - cuda-tile"
 echo
 echo "  HuggingFace & ML:"
-echo "    - transformers, datasets, huggingface_hub"
-echo "    - torch, torchaudio"
+echo "    - transformers, datasets, huggingface_hub, safetensors"
+if [ "${IS_BLACKWELL}" = true ]; then
+	echo "    - torch, torchaudio (nightly, cu128 for Blackwell)"
+else
+	echo "    - torch, torchaudio (stable, cu124)"
+fi
 echo "    - streamlit"
 echo "    - soundfile, librosa"
 echo

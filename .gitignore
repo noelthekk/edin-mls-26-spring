@@ -21,3 +21,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Lock files (platform-specific, use requirements-*.lock as reference)
+requirements.lock
