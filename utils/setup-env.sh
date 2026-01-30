@@ -4,7 +4,7 @@ set -eo pipefail
 # =========================
 # Config
 # =========================
-ENV_NAME="cutile"
+ENV_NAME="mls"  # Machine Learning Systems - shared by cutile-tutorial and hw1
 PYTHON_VERSION="3.11"
 CUDA_TAG="cuda13x"
 MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
@@ -150,8 +150,9 @@ if [ -n "${CONDA_ENV_PATH}" ]; then
 	mkdir -p "${CONDA_ENV_PATH}/etc/conda/activate.d"
 	mkdir -p "${CONDA_ENV_PATH}/etc/conda/deactivate.d"
 
-	# Get the directory containing this script (for hack-hopper path)
+	# Get the project root directory (parent of utils/)
 	SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+	PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 	# Create activation script
 	cat >"${CONDA_ENV_PATH}/etc/conda/activate.d/cutile_env.sh" <<EOF
@@ -178,12 +179,12 @@ if [ "${IS_BLACKWELL}" = false ]; then
 	ask_continue "Apply Hopper hack?"
 
 	# Add hack-hopper to PYTHONPATH in activation script
-	if [ -n "${CONDA_ENV_PATH}" ] && [ -n "${SCRIPT_DIR}" ]; then
+	if [ -n "${CONDA_ENV_PATH}" ] && [ -n "${PROJECT_ROOT}" ]; then
 		# Append to existing activation script
 		cat >>"${CONDA_ENV_PATH}/etc/conda/activate.d/cutile_env.sh" <<EOF
 
 # Hopper hack: use CuPy-based compatibility layer for non-Blackwell GPUs
-export CUTILE_HACK_HOPPER_DIR="${SCRIPT_DIR}/hack-hopper"
+export CUTILE_HACK_HOPPER_DIR="${PROJECT_ROOT}/cutile-tutorial/hack-hopper"
 export PYTHONPATH="\${CUTILE_HACK_HOPPER_DIR}:\${PYTHONPATH}"
 EOF
 
@@ -199,7 +200,7 @@ fi
 unset CUTILE_HACK_HOPPER_DIR
 EOF
 		echo "    Hopper hack installed to conda environment activation scripts."
-		echo "    hack-hopper path: ${SCRIPT_DIR}/hack-hopper"
+		echo "    hack-hopper path: ${PROJECT_ROOT}/cutile-tutorial/hack-hopper"
 	fi
 fi
 
@@ -215,6 +216,24 @@ pip install pynvml
 pip install numpy
 
 # =========================
+# HuggingFace & ML Tools (for hw1-asr and beyond)
+# =========================
+echo ">>> Installing HuggingFace ecosystem and ML tools"
+ask_continue "Install HuggingFace (transformers, datasets, etc.) and Streamlit?"
+
+# HuggingFace ecosystem
+pip install transformers datasets huggingface_hub accelerate
+
+# Streamlit for web apps
+pip install streamlit
+
+# Audio processing (for ASR tasks)
+pip install soundfile librosa
+
+# PyTorch (if not already installed by transformers)
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# =========================
 # Freeze snapshot
 # =========================
 echo ">>> Writing lock snapshot (requirements.lock)"
@@ -225,17 +244,25 @@ conda list --export >requirements.lock
 # =========================
 echo
 echo "============================================="
-echo " cuTile Python environment is ready."
+echo " MLS Python environment is ready."
+echo " (Machine Learning Systems - cutile + hw1)"
 echo "============================================="
 echo
 echo "Activate with:"
 echo "  conda activate ${ENV_NAME}"
 echo
 echo "Installed key packages:"
-echo "  - nvidia::cuda (via conda)"
-echo "  - cupy-${CUDA_TAG}"
-echo "  - cuda-python"
-echo "  - cuda-tile"
+echo "  CUDA/cuTile stack:"
+echo "    - nvidia::cuda (via conda)"
+echo "    - cupy-${CUDA_TAG}"
+echo "    - cuda-python"
+echo "    - cuda-tile"
+echo
+echo "  HuggingFace & ML:"
+echo "    - transformers, datasets, huggingface_hub"
+echo "    - torch, torchaudio"
+echo "    - streamlit"
+echo "    - soundfile, librosa"
 echo
 echo "GPU: ${GPU_NAME:-unknown}"
 if [ "${IS_BLACKWELL}" = true ]; then
