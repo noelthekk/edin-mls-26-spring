@@ -92,6 +92,58 @@ If you want to try Cutil on non-Blackwell GPUs, run the compatibility script bef
 source utils/hack.sh
 ```
 
+## Choosing the Right GPU Programming Tool
+
+Before diving into the homework, it's worth understanding where the tools we teach fit in the broader GPU programming landscape.
+
+```mermaid
+flowchart TD
+    Start(["🎯 GPU Programming<br/> Tool Selection"])
+    Q1{"Access to Blackwell? [1]"}
+
+    Start --> Q1
+
+    Q1 -->|Yes| A{"Go deeper<br/>in GPU kernel?"}
+    Q1 -->|No| B{"Focus on<br/>algorithm only?"}
+
+    A -->|Yes| C{"Want to be a<br/>super geek on GPU?"}
+    A -->|No| D["💎 Cutile [4]<br/>Hardware-Software<br/>Co-design"]
+
+    C -->|Yes| E["🔥 CUDA [2]<br/>Maximum Control <br/>and Performance"]
+    C -->|No| F["⚡ Triton<br/>Kernel Development"]
+
+    B -->|Yes| G["🐍 CuPy<br/>NumPy-compatible <br/>GPU Arrays"]
+    B -->|No| H["⚡ Triton [3]<br/>OpenAI's Compiler<br/>Framework"]
+
+    style Start fill:#667eea,stroke:#5a67d8,color:#fff
+    style E fill:#76b900,stroke:#5a9900,color:#fff
+    style F fill:#f97316,stroke:#ea580c,color:#fff
+    style D fill:#8b5cf6,stroke:#7c3aed,color:#fff
+    style G fill:#06b6d4,stroke:#0891b2,color:#fff
+    style H fill:#f97316,stroke:#ea580c,color:#fff
+```
+
+### Tool Comparison
+
+| **Tool** | **Difficulty** | **Performance Control** | **Best For** |
+|----------|----------------|-------------------------|--------------|
+| **CUDA** | ⭐⭐⭐⭐⭐ | Ultimate | Deep optimization, Nvidia careers |
+| **Triton** | ⭐⭐⭐ | High | Rapid prototyping, research |
+| **Cutile** | ⭐⭐ | High | Hardware-software co-design |
+| **CuPy** | ⭐ | Medium | NumPy users, quick migration |
+
+### Notes & References
+
+**[1] Blackwell GPU Access** — If you need access to Nvidia's Blackwell architecture, the most budget-friendly option is the RTX 5060 available through [vast.ai](http://vast.ai), priced at just $0.10 per hour. This makes it an accessible choice for students and researchers who want to experiment with Cutile without significant upfront costs.
+
+**[2] CUDA Career Path** — Mastering CUDA is a strong pathway to a career at Nvidia. If you're interested in pursuing this route, this guide provides a detailed blueprint for landing an entry-level position: [How to Get Hired at Nvidia in 2026](https://example.com/nvidia-hiring-guide)
+
+**[3] Triton at OpenAI** — OpenAI is actively hiring software engineers to work on the Triton compiler, which signals the growing importance of Triton in production ML infrastructure. If you're proficient in Triton, this could be a compelling career opportunity: [Software Engineer, Triton Compiler](https://openai.com/careers/software-engineer-triton-compiler-san-francisco/)
+
+**[4] Why Cutile?** — Cutile offers a balanced approach for those interested in hardware-software co-design. It provides more control than high-level frameworks like CuPy, while being more approachable than writing raw CUDA kernels. This makes it ideal for developers who want to optimize performance without getting lost in low-level details.
+
+---
+
 ## Homework 1: Automatic Speech Recognition
 
 The `hw1-asr/` directory contains a hands-on assignment implementing GPU-accelerated speech recognition:
