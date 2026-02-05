@@ -56,65 +56,6 @@ def compute_freqs_kernel(
     ct.store(sin_out, index=(pid, 0), tile=sin_full)
 
 
-@ct.kernel
-def apply_rope_kernel(
-    q,              # Query: (batch_heads, seq_len, head_dim)
-    k,              # Key: (batch_heads, seq_len, head_dim)
-    cos,            # Cos: (seq_len, half_dim)
-    sin,            # Sin: (seq_len, half_dim)
-    q_out,          # Output query
-    k_out,          # Output key
-    head_dim: ct.Constant[int],
-    half_dim: ct.Constant[int]
-):
-    """
-    Apply rotary position embeddings to Q and K.
-    Assumes full rotary (rotary_dim == head_dim).
-    half_dim = head_dim // 2
-    """
-    pid_bh = ct.bid(0)  # batch * heads
-    pid_s = ct.bid(1)   # sequence position
-
-    # Load Q first half and second half separately
-    q1 = ct.load(q, index=(pid_bh, pid_s, 0), shape=(1, 1, half_dim))
-    q1 = ct.reshape(q1, (half_dim,))
-
-    q2 = ct.load(q, index=(pid_bh, pid_s, half_dim), shape=(1, 1, half_dim))
-    q2 = ct.reshape(q2, (half_dim,))
-
-    # Load K first half and second half
-    k1 = ct.load(k, index=(pid_bh, pid_s, 0), shape=(1, 1, half_dim))
-    k1 = ct.reshape(k1, (half_dim,))
-
-    k2 = ct.load(k, index=(pid_bh, pid_s, half_dim), shape=(1, 1, half_dim))
-    k2 = ct.reshape(k2, (half_dim,))
-
-    # Load cos/sin for this position
-    cos_tile = ct.load(cos, index=(pid_s, 0), shape=(1, half_dim))
-    cos_tile = ct.reshape(cos_tile, (half_dim,))
-
-    sin_tile = ct.load(sin, index=(pid_s, 0), shape=(1, half_dim))
-    sin_tile = ct.reshape(sin_tile, (half_dim,))
-
-    # Apply rotation: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
-    q_rot1 = q1 * cos_tile - q2 * sin_tile
-    q_rot2 = q2 * cos_tile + q1 * sin_tile
-
-    k_rot1 = k1 * cos_tile - k2 * sin_tile
-    k_rot2 = k2 * cos_tile + k1 * sin_tile
-
-    # Store results in two parts
-    q_rot1 = ct.reshape(q_rot1, (1, 1, half_dim))
-    q_rot2 = ct.reshape(q_rot2, (1, 1, half_dim))
-    k_rot1 = ct.reshape(k_rot1, (1, 1, half_dim))
-    k_rot2 = ct.reshape(k_rot2, (1, 1, half_dim))
-
-    ct.store(q_out, index=(pid_bh, pid_s, 0), tile=q_rot1)
-    ct.store(q_out, index=(pid_bh, pid_s, half_dim), tile=q_rot2)
-    ct.store(k_out, index=(pid_bh, pid_s, 0), tile=k_rot1)
-    ct.store(k_out, index=(pid_bh, pid_s, half_dim), tile=k_rot2)
-
-
 # ============================================================================
 # RoPE Classes
 # ============================================================================

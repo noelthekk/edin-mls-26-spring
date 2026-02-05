@@ -19,41 +19,6 @@ def get_stream():
 # ============================================================================
 
 @ct.kernel
-def qk_scores_kernel(
-    q,              # Query: (batch_heads, seq_q, head_dim)
-    k,              # Key: (batch_heads, seq_k, head_dim)
-    scores,         # Output: (batch_heads, seq_q, seq_k)
-    scale: ct.Constant[float],
-    head_dim: ct.Constant[int]
-):
-    """
-    Compute Q @ K^T scaled attention scores.
-    Each block handles one (batch_head, query_pos) pair.
-    """
-    pid_bh = ct.bid(0)  # batch * heads
-    pid_q = ct.bid(1)   # query position
-
-    # Load query vector for this position
-    q_tile = ct.load(q, index=(pid_bh, pid_q, 0), shape=(1, 1, head_dim))
-    q_tile = ct.reshape(q_tile, (head_dim, 1))  # (head_dim, 1) for matmul
-
-    # Load all K vectors (transposed view needed for K^T)
-    # K is (batch_heads, seq_k, head_dim), we need K^T = (head_dim, seq_k)
-    # Load K for this batch_head: shape (seq_k, head_dim)
-    # We'll compute dot products one at a time since we can't load arbitrary seq_k
-
-    # For now, compute Q[i] @ K^T as a reduction over head_dim
-    # This requires loading K row by row
-
-    # Alternative: Use tiled approach with fixed block sizes
-    # For simplicity, load Q vector and iterate over K positions
-    q_vec = ct.reshape(q_tile, (head_dim,))
-
-    # Store scaled dot products
-    # Note: This is a simplified version - in practice we'd tile this better
-
-
-@ct.kernel
 def attention_scores_kernel(
     q,              # Query: (batch_heads, seq_q, head_dim)
     k,              # Key: (batch_heads, seq_k, head_dim)

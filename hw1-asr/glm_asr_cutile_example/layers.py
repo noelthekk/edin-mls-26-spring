@@ -106,46 +106,6 @@ def silu_kernel(x, output, tile_size: ct.Constant[int]):
     ct.store(output, index=(pid,), tile=result)
 
 
-@ct.kernel
-def linear_kernel(
-    x,              # Input: (M, K)
-    weight,         # Weight: (N, K) - stored as (out_features, in_features)
-    output,         # Output: (M, N)
-    M: ct.Constant[int],
-    N: ct.Constant[int],
-    K: ct.Constant[int],
-    TILE_M: ct.Constant[int],
-    TILE_N: ct.Constant[int],
-    TILE_K: ct.Constant[int]
-):
-    """
-    Tiled matrix multiplication: output = x @ weight.T
-    Each block computes a TILE_M x TILE_N output tile.
-    """
-    pid_m = ct.bid(0)
-    pid_n = ct.bid(1)
-
-    # Accumulator
-    acc = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
-
-    # Number of K tiles
-    num_k_tiles = (K + TILE_K - 1) // TILE_K
-
-    for k_idx in range(num_k_tiles):
-        # Load x tile: (TILE_M, TILE_K)
-        x_tile = ct.load(x, index=(pid_m, k_idx), shape=(TILE_M, TILE_K))
-
-        # Load weight tile transposed: weight is (N, K), we need (TILE_K, TILE_N)
-        # Load as (TILE_N, TILE_K) then transpose
-        w_tile = ct.load(weight, index=(pid_n, k_idx), shape=(TILE_N, TILE_K))
-        w_tile_t = ct.transpose(w_tile)  # (TILE_K, TILE_N)
-
-        # Accumulate: (TILE_M, TILE_K) @ (TILE_K, TILE_N)
-        acc = ct.mma(x_tile, w_tile_t, acc)
-
-    ct.store(output, index=(pid_m, pid_n), tile=acc)
-
-
 @ct.kernel(occupancy=2)
 def linear_kernel_tf32(
     x,              # Input: (M, K) - float32
@@ -188,42 +148,6 @@ def linear_kernel_tf32(
 # ============================================================================
 # Fused Kernels for V5 Optimization
 # ============================================================================
-
-@ct.kernel(occupancy=2)
-def linear_silu_kernel(
-    x,              # Input: (M, K) - float32
-    weight_t,       # Weight transposed: (K, N) - pre-transposed, float32
-    output,         # Output: (M, N) - float32
-    M: ct.Constant[int],
-    N: ct.Constant[int],
-    K: ct.Constant[int]
-):
-    """
-    Fused Linear + SiLU: output = SiLU(x @ weight_t)
-    Combines matrix multiplication with SiLU activation in a single kernel.
-    Uses TF32 for tensor core acceleration.
-    """
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
-    pid_m = ct.bid(0)
-    pid_n = ct.bid(1)
-
-    acc = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
-    num_k_tiles = ct.cdiv(K, TILE_K)
-
-    for k_idx in range(num_k_tiles):
-        x_tile = ct.load(x, index=(pid_m, k_idx), shape=(TILE_M, TILE_K), latency=3)
-        w_tile = ct.load(weight_t, index=(k_idx, pid_n), shape=(TILE_K, TILE_N), latency=3)
-
-        x_tf32 = ct.astype(x_tile, ct.tfloat32)
-        w_tf32 = ct.astype(w_tile, ct.tfloat32)
-        acc = ct.mma(x_tf32, w_tf32, acc)
-
-    # Apply SiLU in-register (no intermediate memory write)
-    sigmoid = 1.0 / (1.0 + ct.exp(-acc))
-    acc = acc * sigmoid
-
-    ct.store(output, index=(pid_m, pid_n), tile=acc)
-
 
 @ct.kernel(occupancy=2)
 def linear_gelu_kernel(
@@ -313,28 +237,6 @@ def swiglu_fused_kernel(
 
 
 @ct.kernel
-def linear_bias_kernel(
-    output,         # Input/Output: (M, N)
-    bias,           # Bias: (N,)
-    M: ct.Constant[int],
-    N: ct.Constant[int],
-    TILE_N: ct.Constant[int]
-):
-    """Add bias to linear output."""
-    pid_m = ct.bid(0)
-    pid_n = ct.bid(1)
-
-    out_tile = ct.load(output, index=(pid_m, pid_n), shape=(1, TILE_N))
-    out_tile = ct.reshape(out_tile, (TILE_N,))
-
-    bias_tile = ct.load(bias, index=(pid_n,), shape=(TILE_N,))
-    result = out_tile + bias_tile
-
-    result = ct.reshape(result, (1, TILE_N))
-    ct.store(output, index=(pid_m, pid_n), tile=result)
-
-
-@ct.kernel
 def embedding_kernel(
     indices,        # Input: (batch_size,)
     weight,         # Embedding table: (vocab_size, embed_dim)
@@ -384,63 +286,6 @@ def softmax_kernel(
 
 
 @ct.kernel
-def rope_kernel(
-    q,              # Query: (batch * heads, seq_len, head_dim)
-    k,              # Key: (batch * heads, seq_len, head_dim)
-    cos,            # Cosine: (seq_len, head_dim)
-    sin,            # Sine: (seq_len, head_dim)
-    q_out,          # Output query
-    k_out,          # Output key
-    seq_len: ct.Constant[int],
-    head_dim: ct.Constant[int]
-):
-    """Apply rotary position embeddings."""
-    pid_bh = ct.bid(0)  # batch * heads index
-    pid_s = ct.bid(1)   # sequence position
-
-    # Load q and k for this position
-    q_tile = ct.load(q, index=(pid_bh, pid_s, 0), shape=(1, 1, head_dim))
-    q_tile = ct.reshape(q_tile, (head_dim,))
-
-    k_tile = ct.load(k, index=(pid_bh, pid_s, 0), shape=(1, 1, head_dim))
-    k_tile = ct.reshape(k_tile, (head_dim,))
-
-    # Load cos/sin for this position
-    cos_tile = ct.load(cos, index=(pid_s, 0), shape=(1, head_dim))
-    cos_tile = ct.reshape(cos_tile, (head_dim,))
-
-    sin_tile = ct.load(sin, index=(pid_s, 0), shape=(1, head_dim))
-    sin_tile = ct.reshape(sin_tile, (head_dim,))
-
-    # Split into halves
-    half = head_dim // 2
-
-    q1 = q_tile[:half]
-    q2 = q_tile[half:]
-    k1 = k_tile[:half]
-    k2 = k_tile[half:]
-
-    cos1 = cos_tile[:half]
-    sin1 = sin_tile[:half]
-
-    # Rotate: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
-    q_rot1 = q1 * cos1 - q2 * sin1
-    q_rot2 = q2 * cos1 + q1 * sin1
-    q_result = ct.cat(q_rot1, q_rot2)
-
-    k_rot1 = k1 * cos1 - k2 * sin1
-    k_rot2 = k2 * cos1 + k1 * sin1
-    k_result = ct.cat(k_rot1, k_rot2)
-
-    # Store
-    q_result = ct.reshape(q_result, (1, 1, head_dim))
-    k_result = ct.reshape(k_result, (1, 1, head_dim))
-
-    ct.store(q_out, index=(pid_bh, pid_s, 0), tile=q_result)
-    ct.store(k_out, index=(pid_bh, pid_s, 0), tile=k_result)
-
-
-@ct.kernel
 def attention_scores_kernel(
     q,              # Query: (batch*heads, seq_q, head_dim)
     k,              # Key: (batch*heads, seq_k, head_dim)
@@ -469,30 +314,6 @@ def attention_scores_kernel(
         # Store as scalar
         score_tile = ct.reshape(score, (1, 1, 1))
         ct.store(scores, index=(pid_bh, pid_q, k_pos), tile=score_tile)
-
-
-@ct.kernel
-def attention_softmax_kernel(
-    scores,         # Input/Output: (batch*heads, seq_q, seq_k)
-    seq_k: ct.Constant[int]
-):
-    """Apply softmax to attention scores."""
-    pid_bh = ct.bid(0)
-    pid_q = ct.bid(1)
-
-    # Load row
-    row = ct.load(scores, index=(pid_bh, pid_q, 0), shape=(1, 1, seq_k))
-    row = ct.reshape(row, (seq_k,))
-
-    # Softmax
-    row_max = ct.max(row)
-    row_shifted = row - row_max
-    exp_row = ct.exp(row_shifted)
-    sum_exp = ct.sum(exp_row)
-    result = exp_row / sum_exp
-
-    result = ct.reshape(result, (1, 1, seq_k))
-    ct.store(scores, index=(pid_bh, pid_q, 0), tile=result)
 
 
 @ct.kernel
