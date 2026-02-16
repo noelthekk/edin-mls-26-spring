@@ -69,8 +69,19 @@ def rmsnorm_kernel(
     # Step 3: Normalize: x / sqrt(variance + eps)
     # Step 4: Apply weight and store
 
-    # YOUR CODE HERE
-    pass
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
+
+    x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+
+    # variance = mean(x^2)
+    variance = tl.sum(x * x, axis=0) / hidden_size
+
+    # normalize and apply weight
+    x_norm = x * tl.rsqrt(variance + eps)
+    out = x_norm * w
+    tl.store(y_ptr + pid * stride_y + offs, out, mask=mask)
 
 
 @triton.jit
@@ -104,8 +115,26 @@ def layernorm_kernel(
     # Step 4: Compute variance = mean((x - mean)^2)
     # Step 5: Normalize and apply affine transform
 
-    # YOUR CODE HERE
-    pass
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
+
+    x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0)
+
+    # mean
+    mean = tl.sum(x, axis=0) / hidden_size
+
+    # center
+    x_centered = x - mean
+
+    # variance = mean((x - mean)^2)
+    variance = tl.sum(x_centered * x_centered, axis=0) / hidden_size
+
+    # normalize and apply affine transform
+    x_norm = x_centered * tl.rsqrt(variance + eps)
+    out = x_norm * w + b
+    tl.store(y_ptr + pid * stride_y + offs, out, mask=mask)
 
 
 @triton.jit
@@ -125,8 +154,23 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 2: Compute tanh approximation
     # Step 3: Store output
 
-    # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+
+    """
+    x*x*x is better as there is no gain in using the function for power
+    (considered it)
+    tl.math.tanh is used instead of tl.extra.cuda.libdevice.tanh
+    As the former approximates better
+    """
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    sqrt_2_over_pi = 0.7978845608028654
+    x3 = x * x * x
+    inner = sqrt_2_over_pi * (x + 0.044715 * x3)
+    out = x * 0.5 * (1.0 + tl.math.tanh(inner))
+    tl.store(y_ptr + offs, out, mask=mask)
 
 
 @triton.jit
@@ -146,8 +190,18 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 2: Compute sigmoid
     # Step 3: Multiply and store
 
-    # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    """
+    Using the standard library function sigmoid() instead
+    of hardcoding.
+    making FP32 wont help as the data is already fp32 coming in
+    
+    """
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    # sigmoid = 1.0 / (1.0 + tl.exp(-x))
+    out = x * tl.sigmoid(x)
+    tl.store(y_ptr + offs, out, mask=mask)
 
 
 @triton.jit
@@ -187,8 +241,29 @@ def linear_kernel_tf32(
     # Step 2: Loop over K tiles and accumulate tl.dot
     # Step 3: Store the result
 
-    # YOUR CODE HERE
-    pass
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
+            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
+            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+
+    tl.store(
+        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
 
 
 @triton.jit
@@ -336,6 +411,18 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     Numerically stable softmax over last dimension.
 
     *** TODO: Implement this kernel ***
+    
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_cols
+
+    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=-float("inf"))
+    x = x - tl.max(x, axis=0)
+    exp_x = tl.exp(x)
+    denom = tl.sum(exp_x, axis=0)
+    y = exp_x / denom
+    tl.store(y_ptr + row * stride_y + offs, y, mask=mask)
+    
     """
     row = tl.program_id(0)
 
@@ -348,8 +435,29 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     # Step 3: Compute exp and normalize
     # Step 4: Store output
 
-    # YOUR CODE HERE
-    pass
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_cols
+
+    # base line
+    # x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=-float("inf")).to(tl.float32)
+
+    # improve: the base is introduced so that it is not recalculated always.
+    base = row * stride_x
+    x = tl.load(x_ptr + base + offs, mask=mask, other=-float("inf")).to(tl.float32)
+
+    # subtract max for numerical stability
+    # x_max = tl.max(x, axis=0)
+    # x_shifted = x - tl.max(x, axis=0)
+
+    # exp and normalize
+    # The normalization is done inside the exp and its faster.
+    x_exp = tl.exp(x - tl.max(x, axis=0))
+    
+    # reciprocal is faster calculate than division on GPU
+    reciprocal_x_sum = 1.0/ tl.sum(x_exp, axis=0)
+    out = x_exp * reciprocal_x_sum
+
+    tl.store(y_ptr + row * stride_y + offs, out, mask=mask)
 
 
 @triton.jit
