@@ -72,16 +72,21 @@ def rmsnorm_kernel(
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < hidden_size
 
-    x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0)
+    # if base is calculated then it can be used in the BLOCK_SIZE no of iterations
+    base_x = pid * stride_x
+    x = tl.load(x_ptr + base_x + offs, mask=mask, other=0.0)
     w = tl.load(w_ptr + offs, mask=mask, other=0.0)
 
     # variance = mean(x^2)
-    variance = tl.sum(x * x, axis=0) / hidden_size
+    # replacing a slow division with fast multiply
+    reciprocal_hidden_size = 1 / hidden_size
+    variance = tl.sum(x * x, axis=0) * reciprocal_hidden_size
 
     # normalize and apply weight
     x_norm = x * tl.rsqrt(variance + eps)
     out = x_norm * w
-    tl.store(y_ptr + pid * stride_y + offs, out, mask=mask)
+    base_y = pid * stride_y
+    tl.store(y_ptr + base_y + offs, out, mask=mask)
 
 
 @triton.jit
@@ -118,23 +123,27 @@ def layernorm_kernel(
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < hidden_size
 
-    x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0)
+    base_x = pid * stride_x
+    x = tl.load(x_ptr + base_x + offs, mask=mask, other=0.0)
     w = tl.load(w_ptr + offs, mask=mask, other=0.0)
     b = tl.load(b_ptr + offs, mask=mask, other=0.0)
 
     # mean
-    mean = tl.sum(x, axis=0) / hidden_size
+    # replacing a slow division with fast multiply
+    reciprocal_hidden_size = 1 / hidden_size
+    mean = tl.sum(x, axis=0) * reciprocal_hidden_size
 
     # center
     x_centered = x - mean
 
     # variance = mean((x - mean)^2)
-    variance = tl.sum(x_centered * x_centered, axis=0) / hidden_size
+    variance = tl.sum(x_centered * x_centered, axis=0) * reciprocal_hidden_size
 
     # normalize and apply affine transform
     x_norm = x_centered * tl.rsqrt(variance + eps)
     out = x_norm * w + b
-    tl.store(y_ptr + pid * stride_y + offs, out, mask=mask)
+    base_y = pid * stride_y
+    tl.store(y_ptr + base_y + offs, out, mask=mask)
 
 
 @triton.jit
@@ -241,29 +250,36 @@ def linear_kernel_tf32(
     # Step 2: Loop over K tiles and accumulate tl.dot
     # Step 3: Store the result
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Calculating the 2d offset outside so no need to iterate
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(
-            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
-            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
-            other=0.0,
-        )
-        acc += tl.dot(a, b)
+    # Calculating the first tiles of A and B,
+    # so its easier to iterate over tile
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        acc,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-    )
+    # Initialize the accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+
+        accumulator = tl.dot(a, b, accumulator)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # storing the result
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # final output from the offsets
+    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.jit
