@@ -59,6 +59,9 @@ def compute_freqs_kernel(
     # Step 4: Compute cos and sin
     # Step 5: Store concatenated cos/sin
 
+    row_cos_ptr = cos_ptr + pid * stride_cos0
+    row_sin_ptr = sin_ptr + pid * stride_sin0
+
     # Load position as scalar
     pos = tl.load(positions_ptr + pid * stride_pos)
 
@@ -75,10 +78,10 @@ def compute_freqs_kernel(
     sin_vals = tl.sin(freqs)
 
     # Store concatenated [cos_half, cos_half] and [sin_half, sin_half]
-    tl.store(cos_ptr + pid * stride_cos0 + offs * stride_cos1, cos_vals, mask=mask)
-    tl.store(cos_ptr + pid * stride_cos0 + (half_dim + offs) * stride_cos1, cos_vals, mask=mask)
-    tl.store(sin_ptr + pid * stride_sin0 + offs * stride_sin1, sin_vals, mask=mask)
-    tl.store(sin_ptr + pid * stride_sin0 + (half_dim + offs) * stride_sin1, sin_vals, mask=mask)
+    tl.store(row_cos_ptr + offs * stride_cos1, cos_vals, mask=mask)
+    tl.store(row_cos_ptr + (half_dim + offs) * stride_cos1, cos_vals, mask=mask)
+    tl.store(row_sin_ptr + offs * stride_sin1, sin_vals, mask=mask)
+    tl.store(row_sin_ptr + (half_dim + offs) * stride_sin1, sin_vals, mask=mask)
 
 
 # ============================================================================
