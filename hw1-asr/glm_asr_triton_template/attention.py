@@ -10,9 +10,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from typing import Optional, Tuple
-
-from scipy.stats import reciprocal
+from typing import Optional
 
 
 def get_stream():
